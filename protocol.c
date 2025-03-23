@@ -1,61 +1,76 @@
 #include "protocol.h"
-#include <malloc.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/types.h>
 
-/**
- * IMPORTANT: sdata WILL BE UNUSABLE AFTER CALLING THIS FUNCTION
- **/
-struct Packet *parse(struct SerialData sdata) {
-  // if (sdata->size < )
-  printf("Serial data: ");
+const struct Packet NULL_PACKET = {
+  NULL_TYPE,
+  0,
+  0,
+  {}
+};
+
+struct Packet parse(struct SerialData sdata) {
+  logMsg(PARSE_FUNC, LOG_INFO, "data:");
   printDataDebug(sdata.data, sdata.size);
-  struct Packet *ret = malloc(sizeof(struct Packet));
-  if (!ret) {
-    printErrMsg("parse: ", ALLOC_ERR_MSG);
-    return NULL;
-  }
+  struct Packet ret;
 
-  int *tmp = getBitArea(sdata.data, 0, 4);
-  ret->type = *tmp;
-  free(tmp);
+  int tmp[1] = {0};
+  getBitArea(sdata.data, 0, 4, tmp);
+  ret.type = *tmp;
 
-  ret->sender = malloc(10 * sizeof(char));
-  if (!ret->sender) {
-    printErrMsg("parse:", "Sender allocation failed!\n");
-    free(ret);
-    return NULL;
-  }
-  ret->receiver = malloc(10 * sizeof(char));
-  if (!ret->receiver) {
-    printErrMsg("parse:", "Receiver allocation failed!\n");
-    free(ret->sender);
-    free(ret);
-    return NULL;
-  }
+  // ret.sender = malloc(10 * sizeof(char));
+  // if (!ret.sender) {
+  //   printErrMsg(PARSE_FUNC, "Sender alloc fail");
+  //   return NULL_PACKET;
+  // }
+  // ret.receiver = malloc(10 * sizeof(char));
+  // if (!ret.receiver) {
+  //   printErrMsg(PARSE_FUNC, "Receiver alloc fail");
+  //   free(ret.sender);
+  //   return NULL_PACKET;
+  // }
   u_int64_t receiver_start =
-      getString(sdata.data, 4, sdata.size, &ret->sender) + 8;
+      getString(sdata.data, 4, sdata.size, &ret.sender) + 8;
   // printf("Sender? %s\n", ret->sender);
-  printDataDebug(getBitArea(sdata.data, receiver_start, sdata.size),
-                 sdata.size - receiver_start);
+
+  if (receiver_start == -1) {
+    printErrMsg(PARSE_FUNC, "sender fail");
+    free(ret.sender);
+    free(ret.receiver);
+    return NULL_PACKET;
+  }
+  // causes mem leak
+  // printDataDebug(getBitArea(sdata->data, receiver_start, sdata->size),
+  //                sdata->size - receiver_start);
 
   u_int64_t bodyStart =
-      getString(sdata.data, receiver_start, sdata.size, &ret->receiver);
-  printDataDebug(getBitArea(sdata.data, bodyStart, sdata.size),
-                 sdata.size - bodyStart);
-
-  ret->body.size = sdata.size - bodyStart;
-  ret->body.data = getBitArea(sdata.data, bodyStart, sdata.size);
-  if (!ret->body.data) { // TODO: more error handling
-    printErrMsg("parse", "Body allocation failed!");
-    free(ret->sender);
-    free(ret->receiver);
-    free(ret);
-    return NULL;
+      getString(sdata.data, receiver_start, sdata.size, &ret.receiver) + 8; // make sure we skip the null byte (which is hopefully there in the first place)
+  // causes mem leak
+  // printDataDebug(getBitArea(sdata->data, bodyStart, sdata->size),
+  //                sdata->size - bodyStart);
+  if (bodyStart == -1) {
+    printErrMsg(PARSE_FUNC, "receiver fail");
+    free(ret.sender);
+    free(ret.receiver);
+    return NULL_PACKET;
   }
 
-  free(sdata.data);
+  ret.body.size = sdata.size - bodyStart;
+  ret.body.data = malloc((sdata.size - bodyStart) / BITS_IN_CONTAINER + 1);
+  if (!ret.body.data) {
+    printErrMsg(PARSE_FUNC, "Body alloc fail");
+    free(ret.sender);
+    free(ret.receiver);
+    return NULL_PACKET;
+  }
+  getBitArea(sdata.data, bodyStart, sdata.size, ret.body.data);
+
+  logMsgF(PARSE_FUNC, LOG_INFO, "Type: %d", ret.type);
+  logMsgF(PARSE_FUNC, LOG_INFO, "Sender: %s", ret.sender);
+  logMsgF(PARSE_FUNC, LOG_INFO, "Recv: %s", ret.receiver);
+  logMsg(PARSE_FUNC, LOG_INFO, "Body:");
+  printDataDebug(ret.body.data, ret.body.size);
+
   return ret;
 }
 
@@ -68,45 +83,63 @@ void printStringBinary(char *str) {
   printf("\n");
 }
 
-/**
- * IMPORTANT: p will be unusable after this!!!
- **/
-struct SerialData *serialize(struct Packet p) {
-  struct SerialData *ret = malloc(sizeof(struct SerialData));
-  if (!ret) {
-    printErrMsg("serialize", "failed to allocate serial data buffer");
-    return NULL;
+struct SerialData serialize(struct Packet p) {
+  struct SerialData ret = {0, NULL};
+  // if (!ret) {
+  //   printErrMsg("serialize", "serial buf alloc fail");
+  //   return NULL;
+  // }
+  const u_int64_t sizeSender = strlen(p.sender), sizeReceiver = strlen(p.receiver);
+  ret.size = sizeSender * 8 + sizeReceiver * 8 + p.body.size + 8 + 8 + 4; // include null bytes and type
+  if (ret.size <= 16) {
+    logMsg("serialize", LOG_WARN, "empty packet");
+    return NULL_DATA;
   }
-  u_int32_t sizeSender = strlen(p.sender), sizeReceiver = strlen(p.receiver);
-  ret->size = sizeSender * 8 + sizeReceiver * 8 + p.body.size + 8;
-  ret->data = malloc(ret->size);
-  if (!ret->data) {
-    printErrMsg("serialize", "failed to allocate data buffer!");
-    free(ret);
-    return NULL;
+  ret.data = malloc(ret.size / BITS_IN_CONTAINER + (ret.size % BITS_IN_CONTAINER == 0 ? 0 : 1));
+  if (!ret.data) {
+    printErrMsg("serialize", "data buf alloc fail");
+    return NULL_DATA;
   }
 
+  memset(ret.data, 0, ret.size / BITS_IN_CONTAINER + (ret.size % BITS_IN_CONTAINER == 0 ? 0 : 1));
   // for (int i = 0; i < 4; i++) {
-  //   setBitRaw(ret->data, i, (p.type >> i) & 1);
+  //   setBitRaw(ret->data, i, (p->type >> i) & 1);
   // }
-  ret->data[0] = p.type;
-  for (int i = 0; i < sizeSender * 8; i++) {
-    setBitRaw(ret->data, i + 4, (p.sender[i / 8] >> (i % 8)) & 1);
+  ret.data[0] = p.type;
+  logMsg("serialize", LOG_INFO, "stream with type:");
+  printDataDebug(ret.data, 4);
+  unsigned int offset = 4;
+  for (int i = 0; i < sizeSender * 8; i++) { // sender
+    setBitRaw(ret.data, i + offset, (p.sender[i / 8] >> (i % 8)) & 1);
   }
-  printStringBinary(p.sender);
-  printDataDebug(ret->data, ret->size);
-  for (int i = 0; i < sizeReceiver * 8; i++) {
-    setBitRaw(ret->data, i + sizeSender * 8 + 12,
-              (p.receiver[i / 8] >> i % 8) & 1);
+  offset += sizeSender * 8;
+  nullChar(ret.data, offset);
+  offset += 8;
+  // printStringBinary(p.sender);
+  // printDataDebug(ret.data, ret->size);
+  for (int i = 0; i < sizeReceiver * 8; i++) { // receiver
+    setBitRaw(ret.data, i + offset,
+              (p.receiver[i / 8] >> (i % 8)) & 1);
   }
-  printDataDebug(ret->data, ret->size);
+  offset += sizeReceiver * 8;
+  nullChar(ret.data, offset);
+  offset += 8;
+  // printDataDebug(ret->data, ret->size);
   for (int i = 0; i < p.body.size; i++) {
-    setBitRaw(ret->data, i + 12 + sizeSender * 8 + sizeReceiver * 8,
+    setBitRaw(ret.data, i + offset,
               (p.body.data[i / BITS_IN_CONTAINER] >> i % BITS_IN_CONTAINER) &
                   1);
   }
-  printDataDebug(ret->data, ret->size);
 
-  free(p.body.data);
+  logMsgF("serialize", LOG_INFO, "Size: %d", ret.size);
+  logMsg("serialize", LOG_INFO, "Data:");
+  printDataDebug(ret.data, ret.size);
   return ret;
+}
+
+void freePacket(struct Packet *p) {
+  free(p->receiver);
+  free(p->sender);
+  free(p->body.data);
+  ok("freePacket");
 }
